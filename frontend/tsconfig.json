@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM"],
+    "module": "none",
+    "noEmitOnError": true,
+    "outFile": "../backend/static/app.js",
+    "strict": true,
+    "target": "ES2022"
+  },
+  "include": ["src/app.ts"]
+}

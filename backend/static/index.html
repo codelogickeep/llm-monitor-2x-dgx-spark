@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LLM Monitor 2X-DGX-Spark</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260812-16" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">LLM</div>
+          <div>
+            <p class="eyebrow">双机 DGX SPARK</p>
+            <h1><span class="brand-title-full">LLM Monitor 2X-DGX-Spark</span><span class="brand-title-short">LLM Monitor</span></h1>
+          </div>
+        </div>
+        <div class="header-state">
+          <div class="live-state">
+            <span id="liveDot" class="dot"></span>
+            <span id="overallStatus">连接中</span>
+          </div>
+          <div class="header-meta">
+            <span>最后采集</span>
+            <strong id="updatedAt">--</strong>
+          </div>
+        </div>
+      </header>
+
+      <nav class="workspace-nav" aria-label="导航">
+        <div class="tabs">
+          <button class="tab active" data-view="dashboard">实时监控</button>
+          <button class="tab" data-view="stats">统计分析</button>
+          <button class="tab" data-view="trends">历史趋势</button>
+          <button class="tab" data-view="alerts">告警记录 <span id="alertsCount" class="nav-count">0</span></button>
+        </div>
+        <div class="model-identity">
+          <span>当前模型</span>
+          <strong id="modelLine">vLLM model</strong>
+          <span id="modelContext" class="model-context">上下文 --</span>
+        </div>
+      </nav>
+
+      <main class="workspace">
+        <section id="alertsBanner" class="alerts" aria-live="polite"></section>
+
+        <section id="dashboardView" class="view active">
+          <div class="section-heading">
+            <div>
+              <p class="section-kicker">INFERENCE SERVICE</p>
+              <h2>推理服务</h2>
+            </div>
+            <span class="section-state"><i class="state-light"></i> vLLM 指标实时采集</span>
+          </div>
+
+          <article class="surface inference-surface">
+            <div class="inference-primary">
+              <div class="kpi-strip">
+                <div class="kpi-cell emphasis"><label>生成吞吐</label><span><strong id="decodeRate">--</strong><small>tok/s</small></span></div>
+                <div class="kpi-cell"><label>最近提示吞吐</label><span><strong id="promptRate">--</strong><small>tok/s</small></span></div>
+                <div class="kpi-cell"><label>最近完成速率</label><span><strong id="requestRate">--</strong><small>req/s</small></span></div>
+                <div class="kpi-cell"><label>运行中</label><span><strong id="running">--</strong><small>请求</small></span></div>
+                <div class="kpi-cell"><label>等待中</label><span><strong id="waiting">--</strong><small>请求</small></span></div>
+                <div class="kpi-cell"><label>KV 缓存</label><span><strong id="kvCache">--</strong></span></div>
+              </div>
+              <div class="latency-strip">
+                <div><label>最近首令牌延迟</label><strong id="ttft">--</strong></div>
+                <div><label>最近端到端延迟</label><strong id="e2e">--</strong></div>
+                <div><label>最近前缀缓存命中</label><strong id="cacheHit">--</strong></div>
+              </div>
+            </div>
+            <div class="chart-zone">
+              <div class="chart-heading">
+                <strong>24 小时令牌吞吐</strong>
+                <span>原始采样 + 采样均值</span>
+              </div>
+              <div class="chart-legend" aria-label="令牌吞吐图例">
+                <span class="legend-item"><i class="legend-swatch prompt-raw"></i><span>提示词 / 原始（左轴）</span></span>
+                <span class="legend-item"><i class="legend-swatch prompt-average"></i><span>提示词 / 采样均值（左轴）</span></span>
+                <span class="legend-item"><i class="legend-swatch generation-raw"></i><span>生成 / 原始（右轴）</span></span>
+                <span class="legend-item"><i class="legend-swatch generation-average"></i><span>生成 / 采样均值（右轴）</span></span>
+              </div>
+              <canvas id="dashboardChart" width="720" height="220"></canvas>
+            </div>
+          </article>
+
+          <div class="section-heading analysis-heading">
+            <div>
+              <p class="section-kicker">OPERATIONS ANALYSIS</p>
+              <h2>运行分析</h2>
+            </div>
+            <div class="analysis-window" role="group" aria-label="分析时间范围">
+              <button class="window-button active" data-analysis-window="900">15 分钟</button>
+              <button class="window-button" data-analysis-window="3600">1 小时</button>
+              <button class="window-button" data-analysis-window="86400">24 小时</button>
+            </div>
+          </div>
+          <section id="analysisPanel" class="surface analysis-panel" aria-live="polite">
+            <div class="analysis-loading">正在生成时间窗分析...</div>
+          </section>
+
+          <div class="section-heading resource-heading">
+            <div>
+              <p class="section-kicker">CLUSTER RESOURCES</p>
+              <h2>双机资源</h2>
+            </div>
+            <span id="nodeSummaryLine" class="section-state">节点状态采集中</span>
+          </div>
+          <section id="nodes" class="node-grid"></section>
+        </section>
+
+        <section id="statsView" class="view">
+          <div class="view-toolbar">
+          <h2>统计</h2>
+          <label>窗口
+            <select id="statsWindow">
+              <option value="1h">1 小时</option>
+              <option value="24h" selected>24 小时</option>
+              <option value="7d">7 天</option>
+              <option value="30d">30 天</option>
+              <option value="60d">60 天</option>
+            </select>
+          </label>
+          </div>
+          <div id="statsContent" class="stack"></div>
+        </section>
+
+        <section id="trendsView" class="view">
+          <div class="view-toolbar wrap">
+          <h2>趋势</h2>
+          <label>范围
+            <select id="trendScope">
+              <option value="node" selected>节点</option>
+              <option value="vllm">推理服务</option>
+            </select>
+          </label>
+          <label id="trendNodeWrap">节点
+            <select id="trendNode">
+              <option value="node-1" selected>dgx-spark-1</option>
+              <option value="node-2">dgx-spark-2</option>
+            </select>
+          </label>
+          <label>指标
+            <select id="trendMetric"></select>
+          </label>
+          <label>窗口
+            <select id="trendWindow">
+              <option value="1d">1 天</option>
+              <option value="7d" selected>7 天</option>
+              <option value="30d">30 天</option>
+              <option value="60d">60 天</option>
+            </select>
+          </label>
+          <label>粒度
+            <select id="trendBucket">
+              <option value="raw">原始</option>
+              <option value="5m">5 分钟</option>
+              <option value="1h" selected>1 小时</option>
+            </select>
+          </label>
+          </div>
+          <article class="surface trend-surface">
+            <div class="panel-head">
+              <h3 id="trendTitle">趋势图</h3>
+              <span id="trendMeta" class="muted"></span>
+            </div>
+            <canvas id="trendChart" width="1100" height="300"></canvas>
+          </article>
+        </section>
+
+        <section id="alertsView" class="view">
+          <div class="view-toolbar">
+            <h2>告警</h2>
+            <label>窗口
+              <select id="alertsWindow">
+                <option value="24h">24 小时</option>
+                <option value="7d" selected>7 天</option>
+                <option value="30d">30 天</option>
+                <option value="60d">60 天</option>
+              </select>
+            </label>
+          </div>
+          <div id="alertsContent" class="stack"></div>
+        </section>
+      </main>
+    </div>
+    <script src="/static/app.js?v=20260812-18"></script>
+  </body>
+</html>
