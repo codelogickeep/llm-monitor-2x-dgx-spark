@@ -18,7 +18,8 @@
 
 - 双节点 GPU、CPU/SoC、统一内存、Swap、内存 PSI、NVMe、功耗与温度监控
 - 200G RoCE 链路状态、吞吐、错误、丢包与网卡温度监控
-- vLLM 提示/生成吞吐、请求速率、运行/等待请求、KV 缓存、TTFT、端到端延迟与前缀缓存命中率
+- vLLM token 入账/交付速率、Prefill/Decode 原生效率、MTP 接受率、请求队列、KV 缓存与延迟
+- 明确区分采集状态、服务活跃状态和请求完成事件，每个历史空值均有可解释语义
 - 15 分钟、1 小时、24 小时运行分析与防误报逻辑
 - SQLite WAL 持久化、60 天滚动保留、历史趋势与告警记录
 - 中文响应式 Web 控制台，支持桌面与手机浏览器
@@ -38,9 +39,13 @@ flowchart LR
 
 ## 指标语义
 
-`运行中`、`等待中` 和 `KV 缓存` 是实时状态，请求结束后回到 0 属于正常行为。提示吞吐、完成速率、TTFT、端到端延迟和缓存命中是短时请求事件；控制台会保留最近一次有效样本 15 分钟，悬停数值可查看样本年龄。SQLite 中保存的仍是原始采样值。
+`运行中`、`等待中` 和 `KV 缓存` 是实时状态，请求结束后回到 0 属于正常行为。提示 token 入账速率、完成速率、TTFT、端到端延迟和缓存命中是短时请求事件；控制台会保留最近一次有效样本 15 分钟，悬停数值可查看样本年龄。SQLite 中保存原始增量、采样间隔和派生值。
 
-首页 24 小时吞吐图的实线展示 SQLite 原始吞吐采样；`0 tok/s` 表示空闲状态，不写入提示词或生成吞吐历史。虚线按 15 分钟分桶，对桶内已记录的正数采样做算术平均，即 `采样值总和 / 采样次数`。15 分钟只用于时间分桶，不作为均值除数。
+有效空闲采样会以 `0 tok/s` 写入数据库，用于计算服务活跃率，但不会进入活跃吞吐均值或吞吐趋势。首页实线展示有 token 增量的原始采样；虚线按 15 分钟分桶，对桶内正数采样做算术平均，即 `采样值总和 / 采样次数`。15 分钟只用于时间分桶，不作为均值除数。
+
+TTFT、端到端延迟、排队、Prefill 和 Decode 时长仅在当前间隔有相应请求完成时才有定义；正常空闲时保存 `NULL`，而不是伪造为 0。采集器使用 `sample_state` 区分空闲、首次预热、计数器重置、指标缺失和采集失败。完整定义与 SQLite 迁移规则见 [vLLM 指标语义与数据模型](docs/METRICS_AND_DATA_MODEL.md)。
+
+`prompt_tok_s` 和 `generation_tok_s` 是 Prometheus 累计 token 在监控采样间隔内的入账/交付速率，反映业务流量，不等同于纯 GPU 计算效率。Prefill/Decode 效率由 vLLM 原生计算 token 与阶段耗时直方图计算。
 
 ## 前提条件
 
@@ -99,7 +104,15 @@ DGX_MONITOR_NODE_1_ROCE_IFACES=enp1s0f1np1
 | `DGX_MONITOR_VLLM_MODELS_URL` | `http://dgx-spark-1.local:8000/v1/models` | OpenAI 模型列表地址 |
 | `DGX_MONITOR_POLL_INTERVAL` | `2.5` | 采样间隔，单位秒 |
 | `DGX_MONITOR_RECENT_VLLM_TTL` | `900` | 最近请求指标保留时间，单位秒 |
+| `DGX_MONITOR_DEPLOYMENT_ID` | `default` | 推理部署版本标识，用于隔离不同配置的性能基线 |
+| `DGX_MONITOR_ALERT_WARNING_SECONDS` | `300` | 警告需持续的时间 |
+| `DGX_MONITOR_ALERT_CRITICAL_SECONDS` | `120` | 温度等严重告警需持续的时间 |
+| `DGX_MONITOR_ALERT_RECOVERY_SECONDS` | `300` | 告警恢复确认时间 |
 | `DGX_MONITOR_DB` | `data/monitor.sqlite3` | SQLite 文件路径 |
+
+节点离线、RoCE 异常、vLLM 指标不可达和抢占立即告警；温度、内存压力、排队与 KV 缓存告警采用持续时间及恢复迟滞，避免阈值附近产生大量短告警。
+
+历史趋势响应最多返回固定数量的数据点，长窗口会自动提高有效分桶粒度。统计页的计数、最小值、最大值、平均值和标准差保持精确；超大窗口的 P95/P99 使用固定上限的均匀样本近似，并以 `≈` 标识。
 
 ## 运行
 

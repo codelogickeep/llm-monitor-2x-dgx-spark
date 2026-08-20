@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LLM Monitor 2X-DGX-Spark</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260812-16" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260820-1" />
   </head>
   <body>
     <div class="app-shell">
@@ -51,14 +51,14 @@
               <p class="section-kicker">INFERENCE SERVICE</p>
               <h2>推理服务</h2>
             </div>
-            <span class="section-state"><i class="state-light"></i> vLLM 指标实时采集</span>
+            <span class="section-state"><i class="state-light"></i><span id="metricState">等待采集</span></span>
           </div>
 
           <article class="surface inference-surface">
             <div class="inference-primary">
               <div class="kpi-strip">
-                <div class="kpi-cell emphasis"><label>生成吞吐</label><span><strong id="decodeRate">--</strong><small>tok/s</small></span></div>
-                <div class="kpi-cell"><label>最近提示吞吐</label><span><strong id="promptRate">--</strong><small>tok/s</small></span></div>
+                <div class="kpi-cell emphasis"><label>生成令牌交付</label><span><strong id="decodeRate">--</strong><small>tok/s</small></span></div>
+                <div class="kpi-cell"><label>最近提示令牌入账</label><span><strong id="promptRate">--</strong><small>tok/s</small></span></div>
                 <div class="kpi-cell"><label>最近完成速率</label><span><strong id="requestRate">--</strong><small>req/s</small></span></div>
                 <div class="kpi-cell"><label>运行中</label><span><strong id="running">--</strong><small>请求</small></span></div>
                 <div class="kpi-cell"><label>等待中</label><span><strong id="waiting">--</strong><small>请求</small></span></div>
@@ -68,18 +68,21 @@
                 <div><label>最近首令牌延迟</label><strong id="ttft">--</strong></div>
                 <div><label>最近端到端延迟</label><strong id="e2e">--</strong></div>
                 <div><label>最近前缀缓存命中</label><strong id="cacheHit">--</strong></div>
+                <div><label>最近 Prefill 计算效率</label><strong><span id="prefillEfficiency">--</span> tok/s</strong></div>
+                <div><label>最近 Decode 计算效率</label><strong><span id="decodeEfficiency">--</span> tok/s</strong></div>
+                <div><label>最近 MTP 接受率</label><strong id="mtpAcceptance">--</strong></div>
               </div>
             </div>
             <div class="chart-zone">
               <div class="chart-heading">
-                <strong>24 小时令牌吞吐</strong>
-                <span>原始采样 + 采样均值</span>
+                <strong>24 小时令牌入账与交付速率</strong>
+                <span>业务流量口径 · 原始采样 + 采样均值</span>
               </div>
               <div class="chart-legend" aria-label="令牌吞吐图例">
-                <span class="legend-item"><i class="legend-swatch prompt-raw"></i><span>提示词 / 原始（左轴）</span></span>
-                <span class="legend-item"><i class="legend-swatch prompt-average"></i><span>提示词 / 采样均值（左轴）</span></span>
-                <span class="legend-item"><i class="legend-swatch generation-raw"></i><span>生成 / 原始（右轴）</span></span>
-                <span class="legend-item"><i class="legend-swatch generation-average"></i><span>生成 / 采样均值（右轴）</span></span>
+                <span class="legend-item"><i class="legend-swatch prompt-raw"></i><span>提示入账 / 原始（左轴）</span></span>
+                <span class="legend-item"><i class="legend-swatch prompt-average"></i><span>提示入账 / 采样均值（左轴）</span></span>
+                <span class="legend-item"><i class="legend-swatch generation-raw"></i><span>生成交付 / 原始（右轴）</span></span>
+                <span class="legend-item"><i class="legend-swatch generation-average"></i><span>生成交付 / 采样均值（右轴）</span></span>
               </div>
               <canvas id="dashboardChart" width="720" height="220"></canvas>
             </div>
@@ -185,6 +188,6 @@
         </section>
       </main>
     </div>
-    <script src="/static/app.js?v=20260812-18"></script>
+    <script src="/static/app.js?v=20260820-1"></script>
   </body>
 </html>

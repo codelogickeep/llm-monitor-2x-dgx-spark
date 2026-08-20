@@ -20,13 +20,25 @@ const vllmMetricOptions = [
     { value: "running", label: "运行中" },
     { value: "waiting", label: "等待中" },
     { value: "kv_cache_usage_pct", label: "KV 缓存" },
-    { value: "prompt_tok_s", label: "提示令牌/秒" },
-    { value: "generation_tok_s", label: "生成令牌/秒" },
+    { value: "prompt_tok_s", label: "提示令牌入账速率" },
+    { value: "cached_prompt_tok_s", label: "缓存提示令牌速率" },
+    { value: "uncached_prompt_tok_s", label: "实际计算提示令牌速率" },
+    { value: "generation_tok_s", label: "生成令牌交付速率" },
     { value: "request_s", label: "请求/秒" },
     { value: "error_s", label: "错误/秒" },
     { value: "ttft_avg_s", label: "首令牌延迟" },
     { value: "e2e_avg_s", label: "端到端延迟" },
+    { value: "queue_avg_s", label: "排队时长" },
+    { value: "prefill_avg_s", label: "Prefill 时长" },
+    { value: "decode_avg_s", label: "Decode 时长" },
+    { value: "itl_avg_s", label: "令牌间延迟" },
     { value: "cache_hit_ratio_pct", label: "缓存命中率" },
+    { value: "request_prompt_tokens_avg", label: "平均提示长度" },
+    { value: "request_generation_tokens_avg", label: "平均输出长度" },
+    { value: "prefill_efficiency_tok_s", label: "Prefill 计算效率" },
+    { value: "decode_efficiency_tok_s", label: "Decode 计算效率" },
+    { value: "mtp_acceptance_pct", label: "MTP 接受率" },
+    { value: "preemption_delta", label: "抢占次数" },
 ];
 const metricUnits = {
     cpu_used_pct: "%",
@@ -48,12 +60,24 @@ const metricUnits = {
     waiting: "请求",
     kv_cache_usage_pct: "%",
     prompt_tok_s: "tok/s",
+    cached_prompt_tok_s: "tok/s",
+    uncached_prompt_tok_s: "tok/s",
     generation_tok_s: "tok/s",
     request_s: "req/s",
     error_s: "req/s",
     ttft_avg_s: "s",
     e2e_avg_s: "s",
+    queue_avg_s: "s",
+    prefill_avg_s: "s",
+    decode_avg_s: "s",
+    itl_avg_s: "s",
     cache_hit_ratio_pct: "%",
+    request_prompt_tokens_avg: "tok",
+    request_generation_tokens_avg: "tok",
+    prefill_efficiency_tok_s: "tok/s",
+    decode_efficiency_tok_s: "tok/s",
+    mtp_acceptance_pct: "%",
+    preemption_delta: "次",
 };
 const trendPresets = {
     raw: { label: "原始", window: "24h", bucket: "raw" },
@@ -283,7 +307,9 @@ function renderAnalysis() {
           </div>
           <strong>${escapeHtml(item.conclusion)}</strong>
           <p>${escapeHtml(item.evidence)}</p>
-          <small>有效覆盖 ${fmt(item.coverage, 1)}%${item.provisional ? " · 临时观察" : " · 正式结论"}</small>
+          <small>${item.id === "inference"
+        ? `采集覆盖 ${fmt(item.coverage, 1)}% · 活跃 ${fmt(item.activity_ratio, 1)}% · 事件样本 ${item.event_samples ?? 0}`
+        : `有效覆盖 ${fmt(item.coverage, 1)}%${item.provisional ? " · 临时观察" : " · 正式结论"}`}</small>
         </article>
       `).join("")}
     </div>
@@ -456,6 +482,20 @@ function updateDashboard(snapshot) {
     setText("modelContext", `上下文 ${snapshot.model.max_model_len || "--"}`);
     updateNodeOptions(snapshot.nodes || {});
     const v = snapshot.vllm || {};
+    const sampleStateText = {
+        ok: "采集正常",
+        warmup: "计数器预热",
+        counter_reset: "检测到计数器重置",
+        metrics_missing: "核心指标缺失",
+        collection_error: "采集失败",
+    };
+    const eventStateText = {
+        idle: "服务空闲",
+        active: "请求处理中",
+        completion_event: "请求已完成",
+        unknown: "活动未知",
+    };
+    setText("metricState", `${sampleStateText[v.sample_state || ""] || "等待采集"} · ${eventStateText[v.event_state || ""] || "状态未知"}`);
     const recentValue = (key) => v.recent?.[key]?.value;
     const markRecentSample = (id, key) => {
         const sample = v.recent?.[key];
@@ -473,12 +513,21 @@ function updateDashboard(snapshot) {
     setText("e2e", recentE2e === null || recentE2e === undefined ? "--" : `${fmt(recentE2e, 2)}s`);
     const recentCacheHit = recentValue("cache_hit_ratio_pct");
     setText("cacheHit", recentCacheHit === null || recentCacheHit === undefined ? "--" : `${fmt(recentCacheHit, 1)}%`);
+    const recentPrefillEfficiency = recentValue("prefill_efficiency_tok_s");
+    const recentDecodeEfficiency = recentValue("decode_efficiency_tok_s");
+    const recentMtpAcceptance = recentValue("mtp_acceptance_pct");
+    setText("prefillEfficiency", fmt(recentPrefillEfficiency, 1));
+    setText("decodeEfficiency", fmt(recentDecodeEfficiency, 1));
+    setText("mtpAcceptance", recentMtpAcceptance === null || recentMtpAcceptance === undefined ? "--" : `${fmt(recentMtpAcceptance, 1)}%`);
     for (const [id, key] of [
         ["promptRate", "prompt_tok_s"],
         ["requestRate", "request_s"],
         ["ttft", "ttft_avg_s"],
         ["e2e", "e2e_avg_s"],
         ["cacheHit", "cache_hit_ratio_pct"],
+        ["prefillEfficiency", "prefill_efficiency_tok_s"],
+        ["decodeEfficiency", "decode_efficiency_tok_s"],
+        ["mtpAcceptance", "mtp_acceptance_pct"],
     ])
         markRecentSample(id, key);
     renderAlertsBanner(snapshot);
@@ -494,8 +543,8 @@ function metricStatsRow(metric, label, stats) {
       <td>${label}</td>
       <td>${fmt(stats?.min, 2)}</td>
       <td>${fmt(stats?.avg, 2)}</td>
-      <td>${fmt(stats?.p95, 2)}</td>
-      <td>${fmt(stats?.p99, 2)}</td>
+      <td>${stats?.percentiles_approximate ? "≈" : ""}${fmt(stats?.p95, 2)}</td>
+      <td>${stats?.percentiles_approximate ? "≈" : ""}${fmt(stats?.p99, 2)}</td>
       <td>${fmt(stats?.max, 2)}</td>
       <td>${stats?.count ?? 0}</td>
     </tr>
@@ -528,6 +577,12 @@ function renderStats(stats) {
         .map((item) => metricStatsRow(item.value, item.label, stats.vllm[item.value]))
         .join("");
     container.innerHTML = `
+    <article class="panel sampling-summary">
+      <div><span>采集覆盖率</span><strong>${fmt(stats.inference_sampling?.collection_coverage_pct, 1)}%</strong></div>
+      <div><span>服务活跃率</span><strong>${fmt(stats.inference_sampling?.activity_ratio_pct, 1)}%</strong></div>
+      <div><span>有效采样</span><strong>${stats.inference_sampling?.collected_samples ?? 0}</strong></div>
+      <div><span>事件样本</span><strong>${stats.inference_sampling?.event_samples ?? 0}</strong></div>
+    </article>
     ${nodeSections.join("")}
     <article class="panel table-panel">
       <div class="panel-head">
@@ -547,7 +602,7 @@ function renderStats(stats) {
 }
 function renderTrend(trend) {
     const metricLabel = currentTrendLabel();
-    setText("trendMeta", `窗口 ${formatWindowLabel(trend.window_seconds)} · 粒度 ${formatBucketLabel(trend.bucket_seconds)} · ${trend.timestamps.length} 个点`);
+    setText("trendMeta", `窗口 ${formatWindowLabel(trend.window_seconds)} · 粒度 ${formatBucketLabel(trend.bucket_seconds)} · ${trend.timestamps.length} 个点${trend.downsampled ? " · 已自动限点" : ""}`);
     setText("trendTitle", `${metricLabel}`);
     drawSeriesChart($("trendChart"), [
         {
@@ -635,7 +690,7 @@ async function refreshDashboardTrend() {
     ]);
     drawSeriesChart($("dashboardChart"), [
         {
-            label: "提示词 / 原始（左轴）",
+            label: "提示入账 / 原始（左轴）",
             color: "#22d3ee",
             values: promptRaw.values || [],
             timestamps: promptRaw.timestamps || [],
@@ -645,7 +700,7 @@ async function refreshDashboardTrend() {
             maxGapSeconds: 30,
         },
         {
-            label: "提示词 / 采样均值（左轴）",
+            label: "提示入账 / 采样均值（左轴）",
             color: "#f7c948",
             values: promptAverage.values || [],
             timestamps: promptAverage.timestamps || [],
@@ -655,7 +710,7 @@ async function refreshDashboardTrend() {
             maxGapSeconds: 1800,
         },
         {
-            label: "生成 / 原始（右轴）",
+            label: "生成交付 / 原始（右轴）",
             color: "#ff7b72",
             values: generationRaw.values || [],
             timestamps: generationRaw.timestamps || [],
@@ -665,7 +720,7 @@ async function refreshDashboardTrend() {
             maxGapSeconds: 30,
         },
         {
-            label: "生成 / 采样均值（右轴）",
+            label: "生成交付 / 采样均值（右轴）",
             color: "#b28dff",
             values: generationAverage.values || [],
             timestamps: generationAverage.timestamps || [],
@@ -674,7 +729,7 @@ async function refreshDashboardTrend() {
             lineWidth: 2.25,
             maxGapSeconds: 1800,
         },
-    ], "近 24 小时推理吞吐", { unit: "tok/s", windowSeconds: 86400 });
+    ], "近 24 小时令牌入账与交付速率", { unit: "tok/s", windowSeconds: 86400 });
 }
 async function refreshStats() {
     const windowValue = document.getElementById("statsWindow").value;

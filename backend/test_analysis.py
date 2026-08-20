@@ -58,6 +58,8 @@ def build_dataset(
                 "prompt_tok_s": 0.0,
                 "request_s": 0.0,
                 "error_s": 0.0,
+                "sample_state": "ok",
+                "event_state": "idle",
             }
         )
     return {"window_seconds": window_seconds, "nodes": rows, "vllm": vllm}
@@ -97,6 +99,13 @@ class AnalysisTests(unittest.TestCase):
         dataset["nodes"][0]["swap_out_pages_s"] = 9_120_599_000.0
         result = self.analyze(dataset)
         self.assertEqual(self.item(result, "memory")["severity"], "ok")
+
+    def test_idle_null_event_metrics_do_not_reduce_collection_coverage(self) -> None:
+        result = self.analyze(build_dataset(900))
+        inference = self.item(result, "inference")
+        self.assertEqual(inference["severity"], "idle")
+        self.assertGreaterEqual(inference["coverage"], 95.0)
+        self.assertEqual(inference["activity_ratio"], 0.0)
 
 
 if __name__ == "__main__":

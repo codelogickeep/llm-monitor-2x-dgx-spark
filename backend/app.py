@@ -33,6 +33,10 @@ POLL_INTERVAL_S = float(os.environ.get("DGX_MONITOR_POLL_INTERVAL", "2.5"))
 HISTORY_SECONDS = int(os.environ.get("DGX_MONITOR_HISTORY_SECONDS", "7200"))
 HISTORY_MAXLEN = max(120, int(HISTORY_SECONDS / POLL_INTERVAL_S))
 RECENT_VLLM_TTL_S = float(os.environ.get("DGX_MONITOR_RECENT_VLLM_TTL", "900"))
+DEPLOYMENT_ID = os.environ.get("DGX_MONITOR_DEPLOYMENT_ID", "default").strip() or "default"
+ALERT_WARNING_S = float(os.environ.get("DGX_MONITOR_ALERT_WARNING_SECONDS", "300"))
+ALERT_CRITICAL_S = float(os.environ.get("DGX_MONITOR_ALERT_CRITICAL_SECONDS", "120"))
+ALERT_RECOVERY_S = float(os.environ.get("DGX_MONITOR_ALERT_RECOVERY_SECONDS", "300"))
 
 def csv_env(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
@@ -78,6 +82,16 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return value
     except (TypeError, ValueError):
         return default
+
+
+def optional_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+    except (TypeError, ValueError):
+        return None
 
 
 def run_http_text(url: str, timeout: float = 4.0) -> str:
@@ -136,36 +150,76 @@ def parse_prometheus(text: str) -> dict[str, Any]:
             continue
         name, labels_raw, value_raw = match.groups()
         labels = dict(LABEL_RE.findall(labels_raw or ""))
-        value = safe_float(value_raw)
+        value = optional_float(value_raw)
+        if value is None:
+            continue
         metric = metrics.setdefault(name, {})
         metric[labels_key(labels)] = {"labels": labels, "value": value}
     return metrics
 
 
-def metric_value(metrics: dict[str, Any], name: str, **labels: str) -> float:
-    entries = metrics.get(name) or {}
-    for entry in entries.values():
-        if all(entry["labels"].get(key) == value for key, value in labels.items()):
-            return safe_float(entry["value"])
-    return 0.0
-
-
-def metric_sum(metrics: dict[str, Any], name: str, **labels: str) -> float:
+def metric_sum(metrics: dict[str, Any], name: str, **labels: str) -> float | None:
     entries = metrics.get(name) or {}
     total = 0.0
+    matched = False
     for entry in entries.values():
         if all(entry["labels"].get(key) == value for key, value in labels.items()):
-            total += safe_float(entry["value"])
-    return total
+            value = optional_float(entry["value"])
+            if value is not None:
+                total += value
+                matched = True
+    return total if matched else None
+
+
+def metric_max(metrics: dict[str, Any], name: str, **labels: str) -> float | None:
+    entries = metrics.get(name) or {}
+    values = [
+        value
+        for entry in entries.values()
+        if all(entry["labels"].get(key) == expected for key, expected in labels.items())
+        and (value := optional_float(entry["value"])) is not None
+    ]
+    return max(values) if values else None
+
+
+def counter_delta(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any],
+    key: str,
+) -> tuple[float | None, bool]:
+    """Return a counter delta and whether a reset was observed."""
+    current_value = optional_float(current.get(key))
+    previous_value = optional_float((previous or {}).get(key))
+    if current_value is None or previous_value is None:
+        return None, False
+    delta = current_value - previous_value
+    if delta < 0:
+        return None, True
+    return delta, False
+
+
+def rate_from_delta(delta: float | None, elapsed_s: float | None) -> float | None:
+    if delta is None or elapsed_s is None or elapsed_s <= 0:
+        return None
+    return delta / max(0.001, elapsed_s)
+
+
+def interval_mean(
+    deltas: dict[str, float | None],
+    sum_key: str,
+    count_key: str,
+) -> float | None:
+    count = deltas.get(count_key)
+    total = deltas.get(sum_key)
+    if count is None or total is None or count <= 0 or total < 0:
+        return None
+    return total / count
 
 
 def counter_rate(previous: dict[str, Any] | None, current: dict[str, Any], key: str, elapsed_s: float) -> float:
-    if not previous:
-        return 0.0
-    delta = safe_float(current.get(key)) - safe_float(previous.get(key))
-    if delta < 0:
-        return 0.0
-    return delta / max(0.001, elapsed_s)
+    """Compatibility helper for node counters, where a missing delta is displayed as zero."""
+    delta, _ = counter_delta(previous, current, key)
+    return rate_from_delta(delta, elapsed_s) or 0.0
 
 
 def enrich_recent_vllm_metrics(snapshot: dict[str, Any], recent: dict[str, dict[str, float]]) -> None:
@@ -176,6 +230,10 @@ def enrich_recent_vllm_metrics(snapshot: dict[str, Any], recent: dict[str, dict[
         "request_s": snapshot.get("request_s") if safe_float(snapshot.get("request_s")) > 0 else None,
         "ttft_avg_s": snapshot.get("ttft_avg_s"),
         "e2e_avg_s": snapshot.get("e2e_avg_s"),
+        "queue_avg_s": snapshot.get("queue_avg_s"),
+        "prefill_efficiency_tok_s": snapshot.get("prefill_efficiency_tok_s"),
+        "decode_efficiency_tok_s": snapshot.get("decode_efficiency_tok_s"),
+        "mtp_acceptance_pct": snapshot.get("mtp_acceptance_pct"),
         "cache_hit_ratio_pct": (
             snapshot.get("cache_hit_ratio_pct") if safe_float(snapshot.get("prompt_tok_s")) > 0 else None
         ),
@@ -337,94 +395,292 @@ class MonitorState:
             self.history.append(snapshot)
 
 
+class AlertDebouncer:
+    """Require sustained threshold violations and stable recovery before changing alerts."""
+
+    def __init__(self) -> None:
+        self.states: dict[str, dict[str, Any]] = {}
+
+    def seed(self, alerts: list[dict[str, Any]], ts: float) -> None:
+        for alert in alerts:
+            key = str(alert.get("signature") or "")
+            if not key:
+                continue
+            self.states[key] = {
+                "emitted": dict(alert),
+                "candidate": dict(alert),
+                "candidate_token": str(alert.get("level")),
+                "candidate_since": ts,
+            }
+
+    def _delay(self, key: str, alert: dict[str, Any] | None) -> float:
+        if alert is None:
+            return ALERT_RECOVERY_S
+        if key.startswith("roce:") or key.endswith(":offline") or key in {
+            "vllm:metrics:error",
+            "vllm:preemption",
+            "model:unavailable",
+        }:
+            return 0.0
+        return ALERT_CRITICAL_S if alert.get("level") == "critical" else ALERT_WARNING_S
+
+    def update(self, alerts: list[dict[str, Any]], ts: float) -> list[dict[str, Any]]:
+        current = {str(alert["signature"]): dict(alert) for alert in alerts if alert.get("signature")}
+        for key in set(self.states).union(current):
+            raw = current.get(key)
+            token = str(raw.get("level")) if raw is not None else "clear"
+            state = self.states.setdefault(
+                key,
+                {
+                    "emitted": None,
+                    "candidate": raw,
+                    "candidate_token": token,
+                    "candidate_since": ts,
+                },
+            )
+            if state["candidate_token"] != token:
+                state["candidate"] = raw
+                state["candidate_token"] = token
+                state["candidate_since"] = ts
+            elif raw is not None:
+                state["candidate"] = raw
+
+            emitted = state.get("emitted")
+            if emitted is not None and raw is not None and emitted.get("level") == raw.get("level"):
+                state["emitted"] = raw
+                continue
+
+            if ts - float(state["candidate_since"]) < self._delay(key, raw):
+                continue
+            state["emitted"] = dict(raw) if raw is not None else None
+            if raw is None:
+                self.states.pop(key, None)
+
+        result = [state["emitted"] for state in self.states.values() if state.get("emitted") is not None]
+        return sorted(result, key=lambda item: (item.get("level") != "critical", str(item.get("scope"))))
+
+
 STATE = MonitorState()
 STORE = MonitorStore(DB_PATH)
+ALERT_FILTER = AlertDebouncer()
 NEXT_CLEANUP_TS = 0.0
-app = FastAPI(title="LLM Monitor 2X-DGX-Spark", version="2026.08.12")
+app = FastAPI(title="LLM Monitor 2X-DGX-Spark", version="2026.08.20")
 
 
 def build_vllm_snapshot(metrics_text: str, previous: dict[str, Any] | None) -> dict[str, Any]:
     ts = now()
     metrics = parse_prometheus(metrics_text)
     counters = {
-        "prompt_tokens_total": metric_value(metrics, "vllm:prompt_tokens_total"),
-        "prompt_tokens_cached_total": metric_value(metrics, "vllm:prompt_tokens_cached_total"),
-        "generation_tokens_total": metric_value(metrics, "vllm:generation_tokens_total"),
+        "prompt_tokens_total": metric_sum(metrics, "vllm:prompt_tokens_total"),
+        "prompt_tokens_cached_total": metric_sum(metrics, "vllm:prompt_tokens_cached_total"),
+        "prompt_local_compute_total": metric_sum(
+            metrics,
+            "vllm:prompt_tokens_by_source_total",
+            source="local_compute",
+        ),
+        "generation_tokens_total": metric_sum(metrics, "vllm:generation_tokens_total"),
         "request_success_total": metric_sum(metrics, "vllm:request_success_total"),
-        "request_error_total": metric_value(metrics, "vllm:request_error_total")
-        or metric_sum(metrics, "vllm:request_success_total", finished_reason="error"),
-        "request_abort_total": metric_value(metrics, "vllm:request_abort_total")
-        or metric_sum(metrics, "vllm:request_success_total", finished_reason="abort"),
-        "num_preemptions_total": metric_value(metrics, "vllm:num_preemptions_total"),
-        "ttft_sum": metric_value(metrics, "vllm:time_to_first_token_seconds_sum"),
-        "ttft_count": metric_value(metrics, "vllm:time_to_first_token_seconds_count"),
-        "e2e_sum": metric_value(metrics, "vllm:e2e_request_latency_seconds_sum"),
-        "e2e_count": metric_value(metrics, "vllm:e2e_request_latency_seconds_count"),
+        "request_error_total": metric_sum(metrics, "vllm:request_success_total", finished_reason="error"),
+        "request_abort_total": metric_sum(metrics, "vllm:request_success_total", finished_reason="abort"),
+        "num_preemptions_total": metric_sum(metrics, "vllm:num_preemptions_total"),
+        "mtp_draft_tokens_total": metric_sum(metrics, "vllm:spec_decode_num_draft_tokens_total"),
+        "mtp_accepted_tokens_total": metric_sum(metrics, "vllm:spec_decode_num_accepted_tokens_total"),
+        "ttft_sum": metric_sum(metrics, "vllm:time_to_first_token_seconds_sum"),
+        "ttft_count": metric_sum(metrics, "vllm:time_to_first_token_seconds_count"),
+        "e2e_sum": metric_sum(metrics, "vllm:e2e_request_latency_seconds_sum"),
+        "e2e_count": metric_sum(metrics, "vllm:e2e_request_latency_seconds_count"),
+        "queue_sum": metric_sum(metrics, "vllm:request_queue_time_seconds_sum"),
+        "queue_count": metric_sum(metrics, "vllm:request_queue_time_seconds_count"),
+        "prefill_time_sum": metric_sum(metrics, "vllm:request_prefill_time_seconds_sum"),
+        "prefill_time_count": metric_sum(metrics, "vllm:request_prefill_time_seconds_count"),
+        "decode_time_sum": metric_sum(metrics, "vllm:request_decode_time_seconds_sum"),
+        "decode_time_count": metric_sum(metrics, "vllm:request_decode_time_seconds_count"),
+        "itl_sum": metric_sum(metrics, "vllm:inter_token_latency_seconds_sum"),
+        "itl_count": metric_sum(metrics, "vllm:inter_token_latency_seconds_count"),
+        "request_prompt_tokens_sum": metric_sum(metrics, "vllm:request_prompt_tokens_sum"),
+        "request_prompt_tokens_count": metric_sum(metrics, "vllm:request_prompt_tokens_count"),
+        "request_generation_tokens_sum": metric_sum(metrics, "vllm:request_generation_tokens_sum"),
+        "request_generation_tokens_count": metric_sum(metrics, "vllm:request_generation_tokens_count"),
+        "prefill_kv_tokens_sum": metric_sum(metrics, "vllm:request_prefill_kv_computed_tokens_sum"),
+        "prefill_kv_tokens_count": metric_sum(metrics, "vllm:request_prefill_kv_computed_tokens_count"),
     }
-    elapsed_s = ts - safe_float((previous or {}).get("ts"), ts)
+    previous_ts = optional_float((previous or {}).get("ts"))
+    elapsed_s = ts - previous_ts if previous_ts is not None and ts > previous_ts else None
     prev_counters = (previous or {}).get("counters") if previous else None
+    deltas: dict[str, float | None] = {}
+    reset_keys: list[str] = []
+    for key in counters:
+        delta, reset = counter_delta(prev_counters, counters, key)
+        deltas[key] = delta
+        if reset:
+            reset_keys.append(key)
 
-    prompt_rate = counter_rate(prev_counters, counters, "prompt_tokens_total", elapsed_s)
-    cached_rate = counter_rate(prev_counters, counters, "prompt_tokens_cached_total", elapsed_s)
-    generation_rate = counter_rate(prev_counters, counters, "generation_tokens_total", elapsed_s)
-    request_rate = counter_rate(prev_counters, counters, "request_success_total", elapsed_s)
-    error_rate = counter_rate(prev_counters, counters, "request_error_total", elapsed_s)
-    abort_rate = counter_rate(prev_counters, counters, "request_abort_total", elapsed_s)
-    preemption_delta = int(max(0, safe_float(counters["num_preemptions_total"]) - safe_float((prev_counters or {}).get("num_preemptions_total"))))
+    waiting = metric_sum(metrics, "vllm:num_requests_waiting")
+    running = metric_sum(metrics, "vllm:num_requests_running")
+    kv_cache = metric_max(metrics, "vllm:kv_cache_usage_perc")
+    waiting_capacity = metric_sum(metrics, "vllm:num_requests_waiting_by_reason", reason="capacity")
+    waiting_deferred = metric_sum(metrics, "vllm:num_requests_waiting_by_reason", reason="deferred")
+    core_keys = {
+        "prompt_tokens_total",
+        "generation_tokens_total",
+        "request_success_total",
+        "ttft_sum",
+        "ttft_count",
+        "e2e_sum",
+        "e2e_count",
+    }
+    missing_metrics = sorted(key for key, value in counters.items() if value is None)
+    core_missing = core_keys.intersection(missing_metrics)
+    for key, value in {"running": running, "waiting": waiting, "kv_cache_usage_perc": kv_cache}.items():
+        if value is None:
+            missing_metrics.append(key)
+            core_missing.add(key)
+    missing_metrics.sort()
+    if core_missing:
+        sample_state = "metrics_missing"
+    elif prev_counters is None or elapsed_s is None:
+        sample_state = "warmup"
+    elif reset_keys:
+        sample_state = "counter_reset"
+    elif any(deltas[key] is None for key in core_keys):
+        sample_state = "warmup"
+    else:
+        sample_state = "ok"
 
-    ttft_delta_count = (
-        safe_float(counters["ttft_count"]) - safe_float(prev_counters.get("ttft_count")) if prev_counters else 0.0
-    )
-    ttft_delta_sum = (
-        safe_float(counters["ttft_sum"]) - safe_float(prev_counters.get("ttft_sum")) if prev_counters else 0.0
-    )
-    e2e_delta_count = (
-        safe_float(counters["e2e_count"]) - safe_float(prev_counters.get("e2e_count")) if prev_counters else 0.0
-    )
-    e2e_delta_sum = (
-        safe_float(counters["e2e_sum"]) - safe_float(prev_counters.get("e2e_sum")) if prev_counters else 0.0
-    )
-    ttft_avg_s = ttft_delta_sum / ttft_delta_count if ttft_delta_count > 0 else None
-    e2e_avg_s = e2e_delta_sum / e2e_delta_count if e2e_delta_count > 0 else None
-    cache_hit_ratio = cached_rate / prompt_rate if prompt_rate > 0 else 0.0
+    if sample_state != "ok":
+        deltas = {key: None for key in counters}
 
-    waiting = metric_value(metrics, "vllm:num_requests_waiting")
-    running = metric_value(metrics, "vllm:num_requests_running")
-    kv_cache = metric_value(metrics, "vllm:kv_cache_usage_perc")
+    prompt_delta = deltas["prompt_tokens_total"]
+    cached_prompt_delta = deltas["prompt_tokens_cached_total"]
+    generation_delta = deltas["generation_tokens_total"]
+    request_completed_delta = deltas["request_success_total"]
+    request_error_delta = deltas["request_error_total"]
+    request_abort_delta = deltas["request_abort_total"]
+    preemption_raw = deltas["num_preemptions_total"]
+    preemption_delta = int(preemption_raw) if preemption_raw is not None else None
+
+    uncached_prompt_delta = deltas["prompt_local_compute_total"]
+    if uncached_prompt_delta is None and prompt_delta is not None and cached_prompt_delta is not None:
+        uncached_prompt_delta = max(0.0, prompt_delta - cached_prompt_delta)
+
+    prompt_rate = rate_from_delta(prompt_delta, elapsed_s)
+    cached_rate = rate_from_delta(cached_prompt_delta, elapsed_s)
+    uncached_rate = rate_from_delta(uncached_prompt_delta, elapsed_s)
+    generation_rate = rate_from_delta(generation_delta, elapsed_s)
+    request_rate = rate_from_delta(request_completed_delta, elapsed_s)
+    error_delta = (
+        request_error_delta + request_abort_delta
+        if request_error_delta is not None and request_abort_delta is not None
+        else None
+    )
+    error_rate = rate_from_delta(error_delta, elapsed_s)
+    cache_hit_ratio = (
+        cached_prompt_delta / prompt_delta
+        if cached_prompt_delta is not None and prompt_delta is not None and prompt_delta > 0
+        else None
+    )
+
+    ttft_avg_s = interval_mean(deltas, "ttft_sum", "ttft_count")
+    e2e_avg_s = interval_mean(deltas, "e2e_sum", "e2e_count")
+    queue_avg_s = interval_mean(deltas, "queue_sum", "queue_count")
+    prefill_avg_s = interval_mean(deltas, "prefill_time_sum", "prefill_time_count")
+    decode_avg_s = interval_mean(deltas, "decode_time_sum", "decode_time_count")
+    itl_avg_s = interval_mean(deltas, "itl_sum", "itl_count")
+    request_prompt_tokens_avg = interval_mean(deltas, "request_prompt_tokens_sum", "request_prompt_tokens_count")
+    request_generation_tokens_avg = interval_mean(
+        deltas,
+        "request_generation_tokens_sum",
+        "request_generation_tokens_count",
+    )
+    prefill_efficiency = None
+    if (deltas["prefill_time_sum"] or 0) > 0 and deltas["prefill_kv_tokens_sum"] is not None:
+        prefill_efficiency = deltas["prefill_kv_tokens_sum"] / deltas["prefill_time_sum"]
+    decode_efficiency = None
+    if (deltas["decode_time_sum"] or 0) > 0 and deltas["request_generation_tokens_sum"] is not None:
+        decode_efficiency = deltas["request_generation_tokens_sum"] / deltas["decode_time_sum"]
+    mtp_acceptance = None
+    if (deltas["mtp_draft_tokens_total"] or 0) > 0 and deltas["mtp_accepted_tokens_total"] is not None:
+        mtp_acceptance = deltas["mtp_accepted_tokens_total"] / deltas["mtp_draft_tokens_total"]
+
+    if sample_state == "ok":
+        if (request_completed_delta or 0) > 0:
+            event_state = "completion_event"
+        elif any((value or 0) > 0 for value in [running, waiting, prompt_delta, generation_delta]):
+            event_state = "active"
+        else:
+            event_state = "idle"
+    else:
+        event_state = "unknown"
+
     health = "ok"
     warnings = []
-    if waiting > 0:
+    if sample_state == "metrics_missing":
+        warnings.append("metrics_missing")
+        health = "warning"
+    elif sample_state == "counter_reset":
+        warnings.append("counter_reset")
+        health = "warning"
+    if (waiting or 0) > 0:
         warnings.append("requests_waiting")
         health = "warning"
-    if kv_cache >= 0.9:
+    if (kv_cache or 0) >= 0.9:
         warnings.append("kv_cache_critical")
         health = "critical"
-    elif kv_cache >= 0.8 and health != "critical":
+    elif (kv_cache or 0) >= 0.8 and health != "critical":
         warnings.append("kv_cache_warning")
         health = "warning"
-    if preemption_delta > 0:
+    if (preemption_delta or 0) > 0:
         warnings.append("preemption_delta")
         health = "critical"
+
+    def rounded(value: float | None, digits: int = 2) -> float | None:
+        return round(value, digits) if value is not None else None
 
     return {
         "ts": ts,
         "status": "ok",
+        "sample_state": sample_state,
+        "event_state": event_state,
+        "deployment_id": DEPLOYMENT_ID,
+        "interval_s": rounded(elapsed_s, 3),
+        "counter_reset": bool(reset_keys),
+        "reset_metrics": reset_keys,
+        "missing_metrics": missing_metrics,
         "health": health,
         "warnings": warnings,
         "running": running,
         "waiting": waiting,
-        "waiting_capacity": metric_value(metrics, "vllm:num_requests_waiting_by_reason", reason="capacity"),
-        "waiting_deferred": metric_value(metrics, "vllm:num_requests_waiting_by_reason", reason="deferred"),
-        "kv_cache_usage_pct": round(kv_cache * 100.0, 2),
-        "prompt_tok_s": round(prompt_rate, 2),
-        "cached_prompt_tok_s": round(cached_rate, 2),
-        "cache_hit_ratio_pct": round(cache_hit_ratio * 100.0, 2),
-        "generation_tok_s": round(generation_rate, 2),
-        "request_s": round(request_rate, 3),
-        "error_s": round(error_rate + abort_rate, 3),
+        "waiting_capacity": waiting_capacity,
+        "waiting_deferred": waiting_deferred,
+        "kv_cache_usage_pct": rounded(kv_cache * 100.0 if kv_cache is not None else None),
+        "prompt_tokens_delta": rounded(prompt_delta, 0),
+        "cached_prompt_tokens_delta": rounded(cached_prompt_delta, 0),
+        "uncached_prompt_tokens_delta": rounded(uncached_prompt_delta, 0),
+        "generation_tokens_delta": rounded(generation_delta, 0),
+        "request_completed_delta": rounded(request_completed_delta, 0),
+        "request_error_delta": rounded(request_error_delta, 0),
+        "request_abort_delta": rounded(request_abort_delta, 0),
+        "prompt_tok_s": rounded(prompt_rate),
+        "cached_prompt_tok_s": rounded(cached_rate),
+        "uncached_prompt_tok_s": rounded(uncached_rate),
+        "cache_hit_ratio_pct": rounded(cache_hit_ratio * 100.0 if cache_hit_ratio is not None else None),
+        "generation_tok_s": rounded(generation_rate),
+        "request_s": rounded(request_rate, 3),
+        "error_s": rounded(error_rate, 3),
         "preemption_delta": preemption_delta,
-        "ttft_avg_s": round(ttft_avg_s, 3) if ttft_avg_s is not None else None,
-        "e2e_avg_s": round(e2e_avg_s, 3) if e2e_avg_s is not None else None,
+        "mtp_draft_tokens_delta": rounded(deltas["mtp_draft_tokens_total"], 0),
+        "mtp_accepted_tokens_delta": rounded(deltas["mtp_accepted_tokens_total"], 0),
+        "mtp_acceptance_pct": rounded(mtp_acceptance * 100.0 if mtp_acceptance is not None else None),
+        "ttft_avg_s": rounded(ttft_avg_s, 3),
+        "e2e_avg_s": rounded(e2e_avg_s, 3),
+        "queue_avg_s": rounded(queue_avg_s, 3),
+        "prefill_avg_s": rounded(prefill_avg_s, 3),
+        "decode_avg_s": rounded(decode_avg_s, 3),
+        "itl_avg_s": rounded(itl_avg_s, 4),
+        "request_prompt_tokens_avg": rounded(request_prompt_tokens_avg, 1),
+        "request_generation_tokens_avg": rounded(request_generation_tokens_avg, 1),
+        "prefill_efficiency_tok_s": rounded(prefill_efficiency),
+        "decode_efficiency_tok_s": rounded(decode_efficiency),
         "counters": counters,
     }
 
@@ -513,13 +769,17 @@ async def collect_once() -> dict[str, Any]:
         vllm = {
             "ts": ts,
             "status": "error",
+            "sample_state": "collection_error",
+            "event_state": "unknown",
+            "deployment_id": DEPLOYMENT_ID,
             "health": "critical",
             "error": str(exc)[-500:],
         }
     STATE.previous_vllm = vllm
 
     model = await collect_model_info()
-    alerts = build_alerts(nodes, vllm, model)
+    raw_alerts = build_alerts(nodes, vllm, model)
+    alerts = ALERT_FILTER.update(raw_alerts, ts)
     overall = "ok"
     if any(item["level"] == "critical" for item in alerts):
         overall = "critical"
@@ -561,7 +821,7 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
                     "level": "critical",
                     "scope": node["name"],
                     "message": f"GPU 温度 {temp}C",
-                    "signature": f"node:{node['id']}:gpu_temp:critical",
+                    "signature": f"node:{node['id']}:gpu_temp",
                 }
             )
         elif temp is not None and temp >= 82:
@@ -570,7 +830,7 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
                     "level": "warning",
                     "scope": node["name"],
                     "message": f"GPU 温度 {temp}C",
-                    "signature": f"node:{node['id']}:gpu_temp:warning",
+                    "signature": f"node:{node['id']}:gpu_temp",
                 }
             )
         cpu_temp = summary.get("cpu_soc_temp_max_c")
@@ -582,7 +842,7 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
                     "level": "critical",
                     "scope": node["name"],
                     "message": f"CPU/SoC 温度 {cpu_temp}C",
-                    "signature": f"node:{node['id']}:cpu_temp:critical",
+                    "signature": f"node:{node['id']}:cpu_temp",
                 }
             )
         elif cpu_temp is not None and cpu_temp >= 85:
@@ -591,7 +851,7 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
                     "level": "warning",
                     "scope": node["name"],
                     "message": f"CPU/SoC 温度 {cpu_temp}C",
-                    "signature": f"node:{node['id']}:cpu_temp:warning",
+                    "signature": f"node:{node['id']}:cpu_temp",
                 }
             )
         if nvme_temp is not None and nvme_temp >= 70:
@@ -600,7 +860,7 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
                     "level": "critical" if nvme_temp >= 80 else "warning",
                     "scope": node["name"],
                     "message": f"NVMe 温度 {nvme_temp}C",
-                    "signature": f"node:{node['id']}:nvme_temp:{'critical' if nvme_temp >= 80 else 'warning'}",
+                    "signature": f"node:{node['id']}:nvme_temp",
                 }
             )
         if nic_temp is not None and nic_temp >= 80:
@@ -609,7 +869,7 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
                     "level": "critical" if nic_temp >= 90 else "warning",
                     "scope": node["name"],
                     "message": f"200G 网卡温度 {nic_temp}C",
-                    "signature": f"node:{node['id']}:nic_temp:{'critical' if nic_temp >= 90 else 'warning'}",
+                    "signature": f"node:{node['id']}:nic_temp",
                 }
             )
         psi = safe_float(pressure.get("some_avg10"))
@@ -620,7 +880,7 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
                     "level": "critical" if psi >= 50 or swap_out >= 2560 else "warning",
                     "scope": node["name"],
                     "message": f"内存压力 PSI={psi:.1f}，换出={swap_out:.1f} 页/秒",
-                    "signature": f"node:{node['id']}:memory_pressure:{'critical' if psi >= 50 or swap_out >= 2560 else 'warning'}",
+                    "signature": f"node:{node['id']}:memory_pressure",
                 }
             )
         for iface in node.get("interfaces", []):
@@ -630,7 +890,7 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
                         "level": "warning" if iface.get("operstate") == "up" else "critical",
                         "scope": f"{node['name']}:{iface['name']}",
                         "message": f"RoCE {iface.get('operstate')} {iface.get('speed_mbps')} Mbps 错误/丢弃={iface.get('error_delta', 0) + iface.get('drop_delta', 0)}",
-                        "signature": f"roce:{node['id']}:{iface['name']}:{iface.get('health')}",
+                        "signature": f"roce:{node['id']}:{iface['name']}",
                     }
                 )
     if vllm.get("status") != "ok":
@@ -643,6 +903,15 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
             }
         )
     else:
+        if vllm.get("sample_state") == "metrics_missing":
+            alerts.append(
+                {
+                    "level": "warning",
+                    "scope": "vLLM",
+                    "message": f"核心指标缺失：{', '.join(vllm.get('missing_metrics') or [])}",
+                    "signature": "vllm:metrics:missing",
+                }
+            )
         if safe_float(vllm.get("waiting")) > 0:
             alerts.append(
                 {
@@ -652,13 +921,14 @@ def build_alerts(nodes: dict[str, Any], vllm: dict[str, Any], model: dict[str, A
                     "signature": "vllm:waiting",
                 }
             )
-        if safe_float(vllm.get("kv_cache_usage_pct")) >= 90:
+        kv_cache = safe_float(vllm.get("kv_cache_usage_pct"))
+        if kv_cache >= 80:
             alerts.append(
                 {
-                    "level": "critical",
+                    "level": "critical" if kv_cache >= 90 else "warning",
                     "scope": "vLLM",
                     "message": f"KV 缓存 {vllm.get('kv_cache_usage_pct')}%",
-                    "signature": "vllm:kv_cache:critical",
+                    "signature": "vllm:kv_cache",
                 }
             )
         if int(vllm.get("preemption_delta") or 0) > 0:
@@ -725,6 +995,7 @@ async def startup() -> None:
     global NEXT_CLEANUP_TS
     await asyncio.to_thread(STORE.cleanup_retention, 60)
     STATE.recent_vllm = await asyncio.to_thread(STORE.recent_vllm_samples, int(RECENT_VLLM_TTL_S))
+    ALERT_FILTER.seed(await asyncio.to_thread(STORE.active_alert_payloads), now())
     NEXT_CLEANUP_TS = next_cleanup_ts()
     asyncio.create_task(poll_loop())
 
@@ -746,6 +1017,7 @@ async def health() -> dict[str, Any]:
         "status": snapshot.get("status"),
         "uptime_s": round(now() - STATE.started_at, 1),
         "updated_at": snapshot.get("updated_at"),
+        "database": await asyncio.to_thread(STORE.database_health),
     }
 
 
@@ -828,8 +1100,15 @@ def slim_history_point(point: dict[str, Any]) -> dict[str, Any]:
         "vllm": {
             key: vllm.get(key)
             for key in [
+                "sample_state",
+                "event_state",
                 "prompt_tok_s",
+                "cached_prompt_tok_s",
+                "uncached_prompt_tok_s",
                 "generation_tok_s",
+                "prefill_efficiency_tok_s",
+                "decode_efficiency_tok_s",
+                "mtp_acceptance_pct",
                 "kv_cache_usage_pct",
                 "running",
                 "waiting",

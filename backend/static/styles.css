@@ -585,10 +585,15 @@ h1 {
   min-width: 0;
   padding: 13px 17px;
   border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
 }
 
-.latency-strip > div:last-child {
+.latency-strip > div:nth-child(3n) {
   border-right: 0;
+}
+
+.latency-strip > div:nth-last-child(-n + 3) {
+  border-bottom: 0;
 }
 
 .latency-strip strong {
@@ -1023,6 +1028,38 @@ canvas {
   gap: 14px;
 }
 
+.sampling-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  overflow: hidden;
+}
+
+.sampling-summary > div {
+  min-width: 0;
+  padding: 14px 16px;
+  border-right: 1px solid var(--line);
+}
+
+.sampling-summary > div:last-child {
+  border-right: 0;
+}
+
+.sampling-summary span,
+.sampling-summary strong {
+  display: block;
+}
+
+.sampling-summary span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.sampling-summary strong {
+  margin-top: 6px;
+  color: var(--text-soft);
+  font-size: 18px;
+}
+
 .table-panel {
   padding: 16px;
   overflow-x: auto;
@@ -1236,6 +1273,18 @@ canvas {
     padding: 12px;
   }
 
+  .sampling-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .sampling-summary > div:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .sampling-summary > div:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--line);
+  }
+
   .chart-zone {
     padding: 15px 13px 10px;
   }
@@ -1383,6 +1432,10 @@ canvas {
 
   .latency-strip > div {
     border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .latency-strip > div:nth-last-child(-n + 3) {
     border-bottom: 1px solid var(--line);
   }
 

@@ -91,6 +91,7 @@ def _item(
     conclusion: str,
     evidence: str,
     coverage: float,
+    **details: Any,
 ) -> dict[str, Any]:
     return {
         "id": item_id,
@@ -100,6 +101,7 @@ def _item(
         "evidence": evidence,
         "coverage": round(coverage * 100.0, 1),
         "provisional": coverage < 0.8,
+        **details,
     }
 
 
@@ -387,20 +389,98 @@ def _inference_analysis(
     window_seconds: int,
     poll_interval_s: float,
 ) -> dict[str, Any]:
-    coverage = _coverage(rows, ["running", "generation_tok_s", "prompt_tok_s", "error_s"], window_seconds, poll_interval_s)
-    active = [row for row in rows if (_number(row.get("running")) or 0) > 0 or (_number(row.get("generation_tok_s")) or 0) > 0 or (_number(row.get("prompt_tok_s")) or 0) > 0]
+    def collected(row: dict[str, Any]) -> bool:
+        state = row.get("sample_state")
+        if state is not None:
+            return state in {"ok", "warmup", "counter_reset"}
+        return any(_number(row.get(key)) is not None for key in ["running", "waiting", "kv_cache_usage_pct"])
+
+    def active_sample(row: dict[str, Any]) -> bool:
+        state = row.get("event_state")
+        if state is not None:
+            return state in {"active", "completion_event"}
+        return any(
+            (_number(row.get(key)) or 0) > 0
+            for key in ["running", "waiting", "generation_tok_s", "prompt_tok_s", "request_s"]
+        )
+
+    collected_rows = [row for row in rows if collected(row)]
+    coverage = _coverage(collected_rows, [], window_seconds, poll_interval_s)
+    active = [row for row in collected_rows if active_sample(row)]
+    activity_ratio = len(active) / len(collected_rows) if collected_rows else 0.0
+    event_samples = sum(
+        1
+        for row in collected_rows
+        if row.get("event_state") == "completion_event"
+        or any(
+            (_number(row.get(key)) or 0) > 0
+            for key in ["prompt_tokens_delta", "generation_tokens_delta", "request_completed_delta"]
+        )
+        or (
+            row.get("event_state") is None
+            and any((_number(row.get(key)) or 0) > 0 for key in ["prompt_tok_s", "generation_tok_s", "request_s"])
+        )
+    )
     if not active:
-        return _item("inference", "推理性能", "idle" if coverage >= 0.8 else "insufficient", "时间窗内没有推理请求，服务处于待机状态", "空闲时的 0 tok/s 不计为性能下降", coverage)
+        return _item(
+            "inference",
+            "推理性能",
+            "idle" if coverage >= 0.8 else "insufficient",
+            "时间窗内没有推理请求，服务处于待机状态",
+            "空闲样本保留为 0，但不计入吞吐或效率基线",
+            coverage,
+            activity_ratio=round(activity_ratio * 100.0, 1),
+            event_samples=event_samples,
+            collected_samples=len(collected_rows),
+        )
     generation = _median([value for value in _values(active, "generation_tok_s") if value > 0])
     prompt = _median([value for value in _values(active, "prompt_tok_s") if value > 0])
+    prefill_efficiency = _median([value for value in _values(active, "prefill_efficiency_tok_s") if value > 0])
+    decode_efficiency = _median([value for value in _values(active, "decode_efficiency_tok_s") if value > 0])
     ttft = _median(_values(active, "ttft_avg_s"))
     waiting_duration = _longest_duration(active, lambda row: (_number(row.get("waiting")) or 0) > 0, poll_interval_s)
-    requests = sum(_values(active, "request_s"))
-    errors = sum(_values(active, "error_s"))
-    error_ratio = errors / max(0.0001, requests + errors)
-    baseline_active = [row for row in baseline_rows if (_number(row.get("generation_tok_s")) or 0) > 0]
+    requests = sum(_values(active, "request_completed_delta"))
+    errors = sum(_values(active, "request_error_delta")) + sum(_values(active, "request_abort_delta"))
+    if requests <= 0:
+        requests = sum(
+            (_number(row.get("request_s")) or 0) * (_number(row.get("interval_s")) or poll_interval_s)
+            for row in active
+        )
+        errors = sum(
+            (_number(row.get("error_s")) or 0) * (_number(row.get("interval_s")) or poll_interval_s)
+            for row in active
+        )
+    error_ratio = errors / max(0.0001, requests)
+    current_deployment = next(
+        (str(row.get("deployment_id")) for row in reversed(active) if row.get("deployment_id")),
+        None,
+    )
+    baseline_active = [
+        row
+        for row in baseline_rows
+        if (_number(row.get("generation_tok_s")) or 0) > 0
+        and (current_deployment is None or str(row.get("deployment_id")) == current_deployment)
+    ]
     baseline_generation = _median(_values(baseline_active, "generation_tok_s"))
     baseline_ttft = _median(_values(baseline_active, "ttft_avg_s"))
+    prompt_length = _median(_values(active, "request_prompt_tokens_avg"))
+    output_length = _median(_values(active, "request_generation_tokens_avg"))
+    cache_hit = _median(_values(active, "cache_hit_ratio_pct"))
+
+    def similar_workload(row: dict[str, Any]) -> bool:
+        def ratio_matches(key: str, target: float | None) -> bool:
+            value = _number(row.get(key))
+            return target is None or value is None or 0.5 <= value / max(1.0, target) <= 2.0
+
+        row_cache = _number(row.get("cache_hit_ratio_pct"))
+        return (
+            ratio_matches("request_prompt_tokens_avg", prompt_length)
+            and ratio_matches("request_generation_tokens_avg", output_length)
+            and (cache_hit is None or row_cache is None or abs(row_cache - cache_hit) <= 20)
+        )
+
+    matched_baseline = [row for row in baseline_active if similar_workload(row)]
+    baseline_decode_efficiency = _median(_values(matched_baseline, "decode_efficiency_tok_s"))
     severity = "ok"
     reasons = []
     if error_ratio > 0.05:
@@ -412,14 +492,14 @@ def _inference_analysis(
     if waiting_duration >= 300 and SEVERITY_ORDER[severity] < SEVERITY_ORDER["warning"]:
         severity = "warning"
         reasons.append("请求持续排队")
-    if baseline_generation and generation is not None and len(baseline_active) >= 10:
-        ratio = generation / max(0.001, baseline_generation)
+    if baseline_decode_efficiency and decode_efficiency is not None and len(matched_baseline) >= 10:
+        ratio = decode_efficiency / max(0.001, baseline_decode_efficiency)
         if ratio < 0.4:
             severity = "critical"
-            reasons.append(f"吞吐仅为 24 小时基线的 {ratio * 100:.0f}%")
+            reasons.append(f"同类负载 Decode 效率仅为 24 小时基线的 {ratio * 100:.0f}%")
         elif ratio < 0.7 and SEVERITY_ORDER[severity] < SEVERITY_ORDER["warning"]:
             severity = "warning"
-            reasons.append(f"吞吐为 24 小时基线的 {ratio * 100:.0f}%")
+            reasons.append(f"同类负载 Decode 效率为 24 小时基线的 {ratio * 100:.0f}%")
     if baseline_ttft and ttft and len(_values(baseline_active, "ttft_avg_s")) >= 5:
         if ttft > baseline_ttft * 4 and ttft - baseline_ttft > 5:
             severity = "critical"
@@ -431,8 +511,24 @@ def _inference_analysis(
     conclusion = "推理性能稳定" if not reasons else "，".join(reasons)
     if coverage < 0.8:
         conclusion = f"样本积累中；当前观察：{conclusion}"
-    evidence = f"活跃中位数：生成 {_fmt(generation)} tok/s，提示 {_fmt(prompt)} tok/s，TTFT {_fmt(ttft, 2)}s；24 小时生成基线 {_fmt(baseline_generation)} tok/s"
-    return _item("inference", "推理性能", formal_severity, conclusion, evidence, coverage)
+    evidence = (
+        f"活跃中位数：生成交付 {_fmt(generation)} tok/s，提示入账 {_fmt(prompt)} tok/s，"
+        f"Prefill 效率 {_fmt(prefill_efficiency)} tok/s，Decode 效率 {_fmt(decode_efficiency)} tok/s，"
+        f"TTFT {_fmt(ttft, 2)}s；同类负载 Decode 基线 {_fmt(baseline_decode_efficiency)} tok/s"
+    )
+    return _item(
+        "inference",
+        "推理性能",
+        formal_severity,
+        conclusion,
+        evidence,
+        coverage,
+        activity_ratio=round(activity_ratio * 100.0, 1),
+        event_samples=event_samples,
+        collected_samples=len(collected_rows),
+        deployment_id=current_deployment,
+        matched_baseline_samples=len(matched_baseline),
+    )
 
 
 def analyze_windows(
