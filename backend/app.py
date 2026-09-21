@@ -398,6 +398,11 @@ class MonitorState:
 class AlertDebouncer:
     """Require sustained threshold violations and stable recovery before changing alerts."""
 
+    IMMEDIATE_RECOVERY_ALERTS = {
+        "vllm:metrics:error",
+        "model:unavailable",
+    }
+
     def __init__(self) -> None:
         self.states: dict[str, dict[str, Any]] = {}
 
@@ -415,6 +420,8 @@ class AlertDebouncer:
 
     def _delay(self, key: str, alert: dict[str, Any] | None) -> float:
         if alert is None:
+            if key in self.IMMEDIATE_RECOVERY_ALERTS:
+                return 0.0
             return ALERT_RECOVERY_S
         if key.startswith("roce:") or key.endswith(":offline") or key in {
             "vllm:metrics:error",
@@ -789,6 +796,7 @@ async def collect_once() -> dict[str, Any]:
     return {
         "status": overall,
         "ts": ts,
+        "deployment_id": DEPLOYMENT_ID,
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
         "poll_interval_s": POLL_INTERVAL_S,
         "nodes": nodes,
@@ -969,6 +977,7 @@ async def poll_loop() -> None:
             snapshot = {
                 "status": "critical",
                 "ts": now(),
+                "deployment_id": DEPLOYMENT_ID,
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "nodes": {},
                 "vllm": {},
@@ -994,8 +1003,12 @@ async def poll_loop() -> None:
 async def startup() -> None:
     global NEXT_CLEANUP_TS
     await asyncio.to_thread(STORE.cleanup_retention, 60)
-    STATE.recent_vllm = await asyncio.to_thread(STORE.recent_vllm_samples, int(RECENT_VLLM_TTL_S))
-    ALERT_FILTER.seed(await asyncio.to_thread(STORE.active_alert_payloads), now())
+    STATE.recent_vllm = await asyncio.to_thread(
+        STORE.recent_vllm_samples,
+        int(RECENT_VLLM_TTL_S),
+        DEPLOYMENT_ID,
+    )
+    ALERT_FILTER.seed(await asyncio.to_thread(STORE.active_alert_payloads, DEPLOYMENT_ID), now())
     NEXT_CLEANUP_TS = next_cleanup_ts()
     asyncio.create_task(poll_loop())
 
@@ -1043,6 +1056,7 @@ async def history(
                 window_seconds=parse_duration_seconds(window, 86400),
                 bucket_seconds=parse_duration_seconds(bucket, 0),
                 node_id=node,
+                deployment_id=DEPLOYMENT_ID,
             )
         )
     payload = await STATE.history_payload(max(1, min(2000, limit)))
@@ -1051,7 +1065,7 @@ async def history(
 
 @app.get("/api/stats")
 async def stats(window: str = "24h") -> JSONResponse:
-    return JSONResponse(STORE.stats(parse_duration_seconds(window, 86400)))
+    return JSONResponse(STORE.stats(parse_duration_seconds(window, 86400), DEPLOYMENT_ID))
 
 
 @app.get("/api/trends")
@@ -1069,26 +1083,30 @@ async def trends(
             window_seconds=parse_duration_seconds(window, 7 * 86400),
             bucket_seconds=parse_duration_seconds(bucket, 0),
             node_id=node,
+            deployment_id=DEPLOYMENT_ID,
         )
     )
 
 
 @app.get("/api/alerts")
 async def alerts(window: str = "24h") -> JSONResponse:
-    return JSONResponse(STORE.alerts(parse_duration_seconds(window, 86400)))
+    return JSONResponse(STORE.alerts(parse_duration_seconds(window, 86400), DEPLOYMENT_ID))
 
 
 @app.get("/api/analysis")
 async def analysis() -> JSONResponse:
     datasets = await asyncio.gather(
-        *[asyncio.to_thread(STORE.analysis_rows, window) for window in [900, 3600, 86400]]
+        *[
+            asyncio.to_thread(STORE.analysis_rows, window, DEPLOYMENT_ID)
+            for window in [900, 3600, 86400]
+        ]
     )
-    return JSONResponse(
-        analyze_windows(
-            {dataset["window_seconds"]: dataset for dataset in datasets},
-            POLL_INTERVAL_S,
-        )
+    payload = analyze_windows(
+        {dataset["window_seconds"]: dataset for dataset in datasets},
+        POLL_INTERVAL_S,
     )
+    payload["deployment_id"] = DEPLOYMENT_ID
+    return JSONResponse(payload)
 
 
 def slim_history_point(point: dict[str, Any]) -> dict[str, Any]:

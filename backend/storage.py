@@ -201,6 +201,7 @@ class MonitorStore:
                 CREATE TABLE IF NOT EXISTS node_metrics (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts REAL NOT NULL,
+                    deployment_id TEXT NOT NULL DEFAULT 'legacy',
                     node_id TEXT NOT NULL,
                     node_name TEXT NOT NULL,
                     cpu_used_pct REAL,
@@ -267,6 +268,7 @@ class MonitorStore:
                     first_ts REAL NOT NULL,
                     last_ts REAL NOT NULL,
                     resolved_ts REAL,
+                    deployment_id TEXT NOT NULL DEFAULT 'legacy',
                     level TEXT NOT NULL,
                     scope TEXT NOT NULL,
                     message TEXT NOT NULL,
@@ -284,6 +286,7 @@ class MonitorStore:
                 for row in self.conn.execute("PRAGMA table_info(node_metrics)").fetchall()
             }
             node_migrations = {
+                "deployment_id": "TEXT NOT NULL DEFAULT 'legacy'",
                 "cpu_soc_temp_max_c": "REAL",
                 "mem_available_mib": "REAL",
                 "swap_used_pct": "REAL",
@@ -305,6 +308,10 @@ class MonitorStore:
             for column, column_type in node_migrations.items():
                 if column not in node_columns:
                     self.conn.execute(f"ALTER TABLE node_metrics ADD COLUMN {column} {column_type}")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_node_metrics_deployment_ts "
+                "ON node_metrics(deployment_id, ts)"
+            )
             vllm_columns = {
                 row["name"]
                 for row in self.conn.execute("PRAGMA table_info(vllm_metrics)").fetchall()
@@ -355,18 +362,24 @@ class MonitorStore:
                 row["name"]
                 for row in self.conn.execute("PRAGMA table_info(alerts)").fetchall()
             }
+            if "deployment_id" not in columns:
+                self.conn.execute("ALTER TABLE alerts ADD COLUMN deployment_id TEXT NOT NULL DEFAULT 'legacy'")
             if "base_key" not in columns:
                 self.conn.execute("ALTER TABLE alerts ADD COLUMN base_key TEXT NOT NULL DEFAULT ''")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_base_key ON alerts(base_key)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_deployment_ts ON alerts(deployment_id, last_ts)")
             self.conn.commit()
 
     def _load_active_alerts(self) -> None:
         with self.lock:
             rows = self.conn.execute(
-                "SELECT id, base_key, scope, level, message FROM alerts WHERE resolved_ts IS NULL"
+                "SELECT id, deployment_id, base_key, scope, level, message FROM alerts WHERE resolved_ts IS NULL"
             ).fetchall()
         self.active_alerts = {
-            (row["base_key"] or f"{row['scope']}|{row['level']}|{row['message']}"): int(row["id"])
+            (
+                str(row["deployment_id"] or "legacy"),
+                row["base_key"] or f"{row['scope']}|{row['level']}|{row['message']}"
+            ): int(row["id"])
             for row in rows
         }
 
@@ -381,6 +394,11 @@ class MonitorStore:
         nodes = snapshot.get("nodes") or {}
         vllm = snapshot.get("vllm") or {}
         alerts = snapshot.get("alerts") or []
+        deployment_id = str(
+            vllm.get("deployment_id")
+            or snapshot.get("deployment_id")
+            or "legacy"
+        )
 
         with self.lock:
             cur = self.conn.cursor()
@@ -392,7 +410,7 @@ class MonitorStore:
                 cur.execute(
                     """
                     INSERT INTO node_metrics (
-                        ts, node_id, node_name, cpu_used_pct, cpu_soc_temp_max_c,
+                        ts, deployment_id, node_id, node_name, cpu_used_pct, cpu_soc_temp_max_c,
                         mem_used_pct, mem_available_mib, swap_used_pct,
                         swap_in_pages_s, swap_out_pages_s,
                         memory_psi_some_avg10, memory_psi_full_avg10,
@@ -402,10 +420,16 @@ class MonitorStore:
                         nic_temp_max_c, disk_used_pct, roce_rx_mbps, roce_tx_mbps,
                         roce_error_delta, roce_link_speed_min_mbps,
                         roce_link_up, probe_latency_ms, health
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?
+                    )
                     """,
                     (
                         ts,
+                        deployment_id,
                         node_id,
                         node.get("name") or node.get("host") or node_id,
                         _safe_float(summary.get("cpu_used_pct")),
@@ -451,7 +475,7 @@ class MonitorStore:
             )
             vllm_values: dict[str, Any] = {
                 "ts": ts,
-                "deployment_id": str(vllm.get("deployment_id") or "default"),
+                "deployment_id": deployment_id,
                 "sample_state": sample_state,
                 "event_state": event_state,
                 "interval_s": _safe_float(vllm.get("interval_s")),
@@ -499,26 +523,34 @@ class MonitorStore:
                 tuple(vllm_values[column] for column in columns),
             )
 
-            self._sync_alerts(cur, alerts, ts)
+            self._sync_alerts(cur, alerts, ts, vllm_values["deployment_id"])
             self.conn.commit()
 
-    def _sync_alerts(self, cur: sqlite3.Cursor, alerts: list[dict[str, Any]], ts: float) -> None:
-        current: dict[str, dict[str, Any]] = {}
+    def _sync_alerts(
+        self,
+        cur: sqlite3.Cursor,
+        alerts: list[dict[str, Any]],
+        ts: float,
+        deployment_id: str,
+    ) -> None:
+        current: dict[tuple[str, str], dict[str, Any]] = {}
         for alert in alerts:
             base_key = str(alert.get("signature") or f"{alert.get('scope')}|{alert.get('level')}|{alert.get('message')}")
-            current[base_key] = alert
-            existing_id = self.active_alerts.get(base_key)
+            alert_key = (deployment_id, base_key)
+            current[alert_key] = alert
+            existing_id = self.active_alerts.get(alert_key)
             if existing_id is None:
                 occurrence_signature = f"{base_key}:{int(ts * 1000)}"
                 cur.execute(
                     """
                     INSERT INTO alerts (
-                        first_ts, last_ts, resolved_ts, level, scope, message, base_key, signature, health
-                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                        first_ts, last_ts, resolved_ts, deployment_id, level, scope, message, base_key, signature, health
+                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ts,
                         ts,
+                        deployment_id,
                         str(alert.get("level") or "warning"),
                         str(alert.get("scope") or "unknown"),
                         str(alert.get("message") or ""),
@@ -527,12 +559,13 @@ class MonitorStore:
                         str(alert.get("level") or "warning"),
                     ),
                 )
-                self.active_alerts[base_key] = int(cur.lastrowid)
+                self.active_alerts[alert_key] = int(cur.lastrowid)
             else:
                 cur.execute(
-                    "UPDATE alerts SET last_ts=?, level=?, scope=?, message=?, base_key=?, health=? WHERE id=?",
+                    "UPDATE alerts SET last_ts=?, deployment_id=?, level=?, scope=?, message=?, base_key=?, health=? WHERE id=?",
                     (
                         ts,
+                        deployment_id,
                         str(alert.get("level") or "warning"),
                         str(alert.get("scope") or "unknown"),
                         str(alert.get("message") or ""),
@@ -542,14 +575,14 @@ class MonitorStore:
                     ),
                 )
 
-        for base_key, row_id in list(self.active_alerts.items()):
-            if base_key in current:
+        for alert_key, row_id in list(self.active_alerts.items()):
+            if alert_key[0] != deployment_id or alert_key in current:
                 continue
             cur.execute(
                 "UPDATE alerts SET last_ts=?, resolved_ts=? WHERE id=? AND resolved_ts IS NULL",
                 (ts, ts, row_id),
             )
-            self.active_alerts.pop(base_key, None)
+            self.active_alerts.pop(alert_key, None)
 
     def cleanup_retention(self, days: int = 60) -> int:
         cutoff = time.time() - days * 86400
@@ -670,34 +703,52 @@ class MonitorStore:
             result[metric] = summary
         return result
 
-    def stats(self, window_seconds: int) -> dict[str, Any]:
+    def stats(self, window_seconds: int, deployment_id: str | None = None) -> dict[str, Any]:
         cutoff = time.time() - window_seconds
         with self.read_lock:
-            node_ids = [row["node_id"] for row in self.read_conn.execute(
-                "SELECT DISTINCT node_id FROM node_metrics WHERE ts >= ? ORDER BY node_id",
-                (cutoff,),
-            ).fetchall()]
+            node_query = "SELECT DISTINCT node_id FROM node_metrics WHERE ts >= ?"
+            node_params: list[Any] = [cutoff]
+            if deployment_id:
+                node_query += " AND deployment_id = ?"
+                node_params.append(deployment_id)
+            node_query += " ORDER BY node_id"
+            node_ids = [row["node_id"] for row in self.read_conn.execute(node_query, tuple(node_params)).fetchall()]
         nodes: dict[str, Any] = {}
         for node_id in node_ids:
+            node_where = "node_id = ?"
+            node_params_tuple: tuple[Any, ...] = (node_id,)
+            if deployment_id:
+                node_where += " AND deployment_id = ?"
+                node_params_tuple += (deployment_id,)
             nodes[node_id] = self._table_stats(
                 "node_metrics",
                 NODE_METRIC_COLUMNS,
                 cutoff,
-                where_sql="node_id = ?",
-                params=(node_id,),
+                where_sql=node_where,
+                params=node_params_tuple,
             )
 
-        vllm = self._table_stats("vllm_metrics", VLLM_METRIC_COLUMNS, cutoff, vllm=True)
+        vllm = self._table_stats(
+            "vllm_metrics",
+            VLLM_METRIC_COLUMNS,
+            cutoff,
+            where_sql="deployment_id = ?" if deployment_id else "",
+            params=(deployment_id,) if deployment_id else (),
+            vllm=True,
+        )
         return {
             "window_seconds": window_seconds,
+            "deployment_id": deployment_id,
             "generated_at": time.time(),
             "nodes": nodes,
             "vllm": vllm,
-            "inference_sampling": self.inference_sampling(window_seconds),
+            "inference_sampling": self.inference_sampling(window_seconds, deployment_id),
         }
 
-    def inference_sampling(self, window_seconds: int) -> dict[str, Any]:
+    def inference_sampling(self, window_seconds: int, deployment_id: str | None = None) -> dict[str, Any]:
         cutoff = time.time() - window_seconds
+        deployment_filter = " AND deployment_id = ?" if deployment_id else ""
+        query_args = (cutoff, deployment_id) if deployment_id else (cutoff,)
         with self.read_lock:
             row = self.read_conn.execute(
                 """
@@ -725,16 +776,14 @@ class MonitorStore:
                         ELSE 0
                     END) AS event_samples
                 FROM vllm_metrics
-                WHERE ts >= ?
-                """,
-                (cutoff,),
+                WHERE ts >= ?""" + deployment_filter,
+                query_args,
             ).fetchone()
             states = self.read_conn.execute(
                 """
                 SELECT COALESCE(sample_state, 'legacy') AS state, COUNT(*) AS count
-                FROM vllm_metrics WHERE ts >= ? GROUP BY state ORDER BY state
-                """,
-                (cutoff,),
+                FROM vllm_metrics WHERE ts >= ?""" + deployment_filter + " GROUP BY state ORDER BY state",
+                query_args,
             ).fetchall()
         total = int(row["total"] or 0)
         collected = int(row["collected"] or 0)
@@ -746,6 +795,7 @@ class MonitorStore:
             "active_samples": active,
             "activity_ratio_pct": round(active / collected * 100.0, 1) if collected else 0.0,
             "event_samples": int(row["event_samples"] or 0),
+            "deployment_id": deployment_id,
             "states": {str(item["state"]): int(item["count"]) for item in states},
         }
 
@@ -757,6 +807,7 @@ class MonitorStore:
         window_seconds: int,
         bucket_seconds: int = 0,
         node_id: str | None = None,
+        deployment_id: str | None = None,
         max_points: int = 5000,
     ) -> dict[str, Any]:
         cutoff = time.time() - window_seconds
@@ -765,11 +816,14 @@ class MonitorStore:
             table = "node_metrics"
             where_sql = "node_id = ?"
             params: tuple[Any, ...] = (node_id or "node-1",)
+            if deployment_id:
+                where_sql += " AND deployment_id = ?"
+                params += (deployment_id,)
         elif kind == "vllm":
             column = VLLM_METRIC_COLUMNS[metric]
             table = "vllm_metrics"
-            where_sql = ""
-            params = ()
+            where_sql = "deployment_id = ?" if deployment_id else ""
+            params = (deployment_id,) if deployment_id else ()
         else:
             raise ValueError(f"unknown series kind: {kind}")
 
@@ -825,6 +879,7 @@ class MonitorStore:
             "kind": kind,
             "metric": metric,
             "node_id": node_id,
+            "deployment_id": deployment_id,
             "window_seconds": window_seconds,
             "bucket_seconds": bucket_seconds,
             "requested_bucket_seconds": requested_bucket_seconds,
@@ -833,10 +888,16 @@ class MonitorStore:
             "values": values,
         }
 
-    def recent_vllm_samples(self, max_age_seconds: int = 900) -> dict[str, dict[str, float]]:
+    def recent_vllm_samples(
+        self,
+        max_age_seconds: int = 900,
+        deployment_id: str | None = None,
+    ) -> dict[str, dict[str, float]]:
         cutoff = time.time() - max_age_seconds
+        deployment_filter = " AND deployment_id = ?" if deployment_id else ""
         conditions = {
             "prompt_tok_s": "prompt_tok_s > 0",
+            "generation_tok_s": "generation_tok_s > 0",
             "request_s": "request_s > 0",
             "ttft_avg_s": "ttft_avg_s IS NOT NULL",
             "e2e_avg_s": "e2e_avg_s IS NOT NULL",
@@ -851,24 +912,26 @@ class MonitorStore:
             for column, condition in conditions.items():
                 row = self.read_conn.execute(
                     f"SELECT ts, {column} AS value FROM vllm_metrics "
-                    f"WHERE ts >= ? AND {condition} ORDER BY ts DESC LIMIT 1",
-                    (cutoff,),
+                    f"WHERE ts >= ?{deployment_filter} AND {condition} ORDER BY ts DESC LIMIT 1",
+                    (cutoff, deployment_id) if deployment_id else (cutoff,),
                 ).fetchone()
                 if row is not None:
                     samples[column] = {"sampled_at": float(row["ts"]), "value": float(row["value"])}
         return samples
 
-    def alerts(self, window_seconds: int) -> dict[str, Any]:
+    def alerts(self, window_seconds: int, deployment_id: str | None = None) -> dict[str, Any]:
         cutoff = time.time() - window_seconds
+        deployment_filter = " AND deployment_id = ?" if deployment_id else ""
+        query_args = (cutoff, cutoff, cutoff, deployment_id) if deployment_id else (cutoff, cutoff, cutoff)
         with self.read_lock:
             rows = self.read_conn.execute(
                 """
-                SELECT id, first_ts, last_ts, resolved_ts, level, scope, message, base_key, signature, health
+                SELECT id, first_ts, last_ts, resolved_ts, deployment_id, level, scope, message, base_key, signature, health
                 FROM alerts
-                WHERE first_ts >= ? OR last_ts >= ? OR resolved_ts >= ?
-                ORDER BY last_ts DESC
-                """,
-                (cutoff, cutoff, cutoff),
+                WHERE (first_ts >= ? OR last_ts >= ? OR resolved_ts >= ?)"""
+                + deployment_filter
+                + " ORDER BY last_ts DESC",
+                query_args,
             ).fetchall()
         items = []
         for row in rows:
@@ -878,6 +941,7 @@ class MonitorStore:
                     "first_ts": float(row["first_ts"]),
                     "last_ts": float(row["last_ts"]),
                     "resolved_ts": float(row["resolved_ts"]) if row["resolved_ts"] is not None else None,
+                    "deployment_id": row["deployment_id"],
                     "level": row["level"],
                     "scope": row["scope"],
                     "message": row["message"],
@@ -889,13 +953,14 @@ class MonitorStore:
             )
         return {"window_seconds": window_seconds, "items": items}
 
-    def active_alert_payloads(self) -> list[dict[str, Any]]:
+    def active_alert_payloads(self, deployment_id: str | None = None) -> list[dict[str, Any]]:
+        deployment_filter = " AND deployment_id = ?" if deployment_id else ""
         with self.read_lock:
             rows = self.read_conn.execute(
                 """
                 SELECT level, scope, message, base_key
-                FROM alerts WHERE resolved_ts IS NULL ORDER BY last_ts
-                """
+                FROM alerts WHERE resolved_ts IS NULL""" + deployment_filter + " ORDER BY last_ts",
+                (deployment_id,) if deployment_id else (),
             ).fetchall()
         return [
             {
@@ -907,23 +972,26 @@ class MonitorStore:
             for row in rows
         ]
 
-    def analysis_rows(self, window_seconds: int) -> dict[str, Any]:
+    def analysis_rows(self, window_seconds: int, deployment_id: str | None = None) -> dict[str, Any]:
         cutoff = time.time() - window_seconds
-        node_columns = ", ".join(["ts", "node_id", *NODE_METRIC_COLUMNS.values()])
+        deployment_filter = " AND deployment_id = ?" if deployment_id else ""
+        query_args = (cutoff, deployment_id) if deployment_id else (cutoff,)
+        node_columns = ", ".join(["ts", "deployment_id", "node_id", *NODE_METRIC_COLUMNS.values()])
         vllm_columns = ", ".join(
             ["ts", "deployment_id", "sample_state", "event_state", *VLLM_ANALYSIS_COLUMNS.values()]
         )
         with self.read_lock:
             node_rows = self.read_conn.execute(
-                f"SELECT {node_columns} FROM node_metrics WHERE ts >= ? ORDER BY ts",
-                (cutoff,),
+                f"SELECT {node_columns} FROM node_metrics WHERE ts >= ?{deployment_filter} ORDER BY ts",
+                query_args,
             ).fetchall()
             vllm_rows = self.read_conn.execute(
-                f"SELECT {vllm_columns} FROM vllm_metrics WHERE ts >= ? ORDER BY ts",
-                (cutoff,),
+                f"SELECT {vllm_columns} FROM vllm_metrics WHERE ts >= ?{deployment_filter} ORDER BY ts",
+                query_args,
             ).fetchall()
         return {
             "window_seconds": window_seconds,
+            "deployment_id": deployment_id,
             "generated_at": time.time(),
             "nodes": [dict(row) for row in node_rows],
             "vllm": [dict(row) for row in vllm_rows],

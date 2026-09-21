@@ -579,7 +579,12 @@ function drawSeriesChart(
     maxGapSeconds?: number;
   }>,
   title: string,
-  options: { unit?: string; windowSeconds?: number } = {},
+  options: {
+    unit?: string;
+    windowSeconds?: number;
+    yAxisHeadroomRatio?: number;
+    yTickIntervals?: number;
+  } = {},
 ): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -603,15 +608,28 @@ function drawSeriesChart(
     left: Math.max(0, ...axisSeries.left.flatMap((item) => item.values).filter(Number.isFinite)),
     right: Math.max(0, ...axisSeries.right.flatMap((item) => item.values).filter(Number.isFinite)),
   };
-  const niceAxisMax = (maximum: number): number => {
+  const coarseAxisMax = (maximum: number): number => {
     const magnitude = 10 ** Math.floor(Math.log10(Math.max(1, maximum)));
     const normalizedMax = maximum / magnitude;
     const niceFactor = normalizedMax <= 1 ? 1 : normalizedMax <= 2 ? 2 : normalizedMax <= 5 ? 5 : 10;
     return Math.max(1, niceFactor * magnitude);
   };
+  const tightAxisMax = (maximum: number, intervals: number, headroomRatio: number): number => {
+    if (!Number.isFinite(maximum) || maximum <= 0) return 1;
+    const rawStep = (maximum * (1 + headroomRatio)) / intervals;
+    const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+    const normalizedStep = rawStep / magnitude;
+    const factors = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+    const factor = factors.find((candidate) => normalizedStep <= candidate) ?? 10;
+    return Math.max(1, factor * magnitude * intervals);
+  };
+  const yTickIntervals = options.yTickIntervals ?? 4;
+  const axisMaximum = (maximum: number): number => options.yAxisHeadroomRatio === undefined
+    ? coarseAxisMax(maximum)
+    : tightAxisMax(maximum, yTickIntervals, options.yAxisHeadroomRatio);
   const axisMax = {
-    left: niceAxisMax(observedMax.left),
-    right: niceAxisMax(observedMax.right),
+    left: axisMaximum(observedMax.left),
+    right: axisMaximum(observedMax.right),
   };
   const hasRightAxis = axisSeries.right.length > 0;
   const plot = {
@@ -626,7 +644,7 @@ function drawSeriesChart(
   const latestTimestamp = Math.max(...allTimestamps);
   const earliestTimestamp = Math.min(...allTimestamps);
   const hasTimeAxis = Number.isFinite(earliestTimestamp) && latestTimestamp > earliestTimestamp;
-  const yTickCount = 5;
+  const yTickCount = yTickIntervals + 1;
 
   const formatAxisValue = (value: number, maximum: number): string => {
     if (maximum < 2) return value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
@@ -1007,7 +1025,12 @@ async function refreshDashboardTrend(): Promise<void> {
       },
     ],
     "近 24 小时令牌入账与交付速率",
-    { unit: "tok/s", windowSeconds: 86400 },
+    {
+      unit: "tok/s",
+      windowSeconds: 86400,
+      yAxisHeadroomRatio: 0.05,
+      yTickIntervals: 5,
+    },
   );
 }
 

@@ -162,6 +162,18 @@ class AlertDebouncerTests(unittest.TestCase):
         offline = {"level": "critical", "scope": "node", "message": "offline", "signature": "node:1:offline"}
         self.assertEqual(len(debouncer.update([offline], 0)), 1)
 
+    def test_service_availability_alert_recovers_immediately(self) -> None:
+        debouncer = AlertDebouncer()
+        unavailable = {
+            "level": "critical",
+            "scope": "vLLM",
+            "message": "HTTP Error 502: Bad Gateway",
+            "signature": "vllm:metrics:error",
+        }
+
+        self.assertEqual(len(debouncer.update([unavailable], 0)), 1)
+        self.assertEqual(debouncer.update([], 0.1), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -136,6 +136,131 @@ class StorageSeriesTests(unittest.TestCase):
                 self.assertEqual(row["generation_tok_s"], 60.0)
                 self.assertEqual(row["deployment_id"], "legacy")
                 self.assertIsNone(row["sample_state"])
+                node_columns = {
+                    item["name"] for item in store.conn.execute("PRAGMA table_info(node_metrics)")
+                }
+                self.assertIn("deployment_id", node_columns)
+            finally:
+                store.close()
+
+    def test_deployment_id_isolated_for_node_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = MonitorStore(Path(directory) / "monitor.sqlite3")
+            now = time.time()
+            try:
+                for offset, deployment_id, gpu_util in [
+                    (20, "deepseek-v4-flash-prod", 20.0),
+                    (10, "qwen3.8-flash-next-nvfp4-prod", 80.0),
+                ]:
+                    store.insert_snapshot(
+                        {
+                            "ts": now - offset,
+                            "vllm": {"deployment_id": deployment_id, "health": "ok"},
+                            "nodes": {
+                                "node-1": {
+                                    "name": "spark-1",
+                                    "summary": {
+                                        "gpu_util_avg_pct": gpu_util,
+                                        "cpu_used_pct": gpu_util / 2,
+                                    },
+                                    "health": "ok",
+                                }
+                            },
+                        }
+                    )
+
+                qwen_stats = store.stats(
+                    3600,
+                    deployment_id="qwen3.8-flash-next-nvfp4-prod",
+                )
+                self.assertEqual(
+                    qwen_stats["nodes"]["node-1"]["gpu_util_avg_pct"]["avg"],
+                    80.0,
+                )
+                qwen_series = store.series(
+                    kind="node",
+                    metric="gpu_util_avg_pct",
+                    node_id="node-1",
+                    window_seconds=3600,
+                    deployment_id="qwen3.8-flash-next-nvfp4-prod",
+                )
+                self.assertEqual(qwen_series["values"], [80.0])
+                self.assertEqual(qwen_series["deployment_id"], "qwen3.8-flash-next-nvfp4-prod")
+                analysis = store.analysis_rows(
+                    3600,
+                    deployment_id="qwen3.8-flash-next-nvfp4-prod",
+                )
+                self.assertEqual({row["deployment_id"] for row in analysis["nodes"]}, {"qwen3.8-flash-next-nvfp4-prod"})
+            finally:
+                store.close()
+
+    def test_deployment_id_isolated_across_vllm_queries_and_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = MonitorStore(Path(directory) / "monitor.sqlite3")
+            now = time.time()
+            try:
+                for offset, deployment_id, generation_rate in [
+                    (20, "deepseek-v4-flash-prod", 10.0),
+                    (10, "qwen3.8-flash-next-nvfp4-prod", 100.0),
+                ]:
+                    store.insert_snapshot(
+                        {
+                            "ts": now - offset,
+                            "vllm": {
+                                "deployment_id": deployment_id,
+                                "prompt_tok_s": generation_rate * 10,
+                                "generation_tok_s": generation_rate,
+                                "health": "ok",
+                            },
+                            "alerts": [
+                                {
+                                    "level": "warning",
+                                    "scope": "vllm",
+                                    "message": f"{deployment_id} warning",
+                                    "signature": "vllm:test",
+                                }
+                            ],
+                        }
+                    )
+
+                qwen_series = store.series(
+                    kind="vllm",
+                    metric="generation_tok_s",
+                    window_seconds=3600,
+                    deployment_id="qwen3.8-flash-next-nvfp4-prod",
+                )
+                self.assertEqual(qwen_series["values"], [100.0])
+                deepseek_stats = store.stats(
+                    3600,
+                    deployment_id="deepseek-v4-flash-prod",
+                )
+                self.assertEqual(deepseek_stats["vllm"]["generation_tok_s"]["avg"], 10.0)
+                self.assertEqual(
+                    deepseek_stats["inference_sampling"]["total_samples"],
+                    1,
+                )
+                recent = store.recent_vllm_samples(
+                    3600,
+                    deployment_id="qwen3.8-flash-next-nvfp4-prod",
+                )
+                self.assertEqual(recent["generation_tok_s"]["value"], 100.0)
+                analysis = store.analysis_rows(
+                    3600,
+                    deployment_id="qwen3.8-flash-next-nvfp4-prod",
+                )
+                self.assertEqual(
+                    {row["deployment_id"] for row in analysis["vllm"]},
+                    {"qwen3.8-flash-next-nvfp4-prod"},
+                )
+                alerts = store.alerts(
+                    3600,
+                    deployment_id="qwen3.8-flash-next-nvfp4-prod",
+                )
+                self.assertEqual(len(alerts["items"]), 1)
+                self.assertEqual(
+                    alerts["items"][0]["deployment_id"],
+                    "qwen3.8-flash-next-nvfp4-prod",
+                )
             finally:
                 store.close()
 
